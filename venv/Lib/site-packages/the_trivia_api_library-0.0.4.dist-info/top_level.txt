@@ -1,0 +1,3 @@
+examples
+tests
+the_trivia_api_library

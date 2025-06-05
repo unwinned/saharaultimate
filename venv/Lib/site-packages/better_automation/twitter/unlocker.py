@@ -1,0 +1,138 @@
+"""
+Для решения FunCaptcha лучше всего использовать FirstCaptcha, OneCaptcha или CapSolver
+"""
+import asyncio
+import time
+
+from playwright.async_api import Error as PlaywrightError, TimeoutError as PlaywrightTimeoutError
+from playwright.async_api import async_playwright, Browser, ProxySettings, Page, Playwright
+from playwright_stealth import stealth_async
+from yarl import URL
+
+from .account import TwitterAccount
+
+TWITTER_FUNCAPTCHA_SITEKEY = "0152B4EB-D2DC-460A-89A1-629838B529C9"
+TWITTER_FUNCAPTCHA_URL = "https://twitter.com/account/access"
+
+
+def proxy_url_to_playwright_proxy(proxy: str) -> ProxySettings:
+    proxy = URL(proxy)
+    return ProxySettings(
+        server=f"{proxy.scheme}://{proxy.host}:{proxy.port}",
+        password=proxy.password,
+        username=proxy.user,
+    )
+
+
+class TwitterAccountUnlocker:
+    def __init__(
+            self,
+            *,
+            headless=False,
+            default_proxy: str = None,
+    ):
+        self._playwright: Playwright | None = None
+        self._browser: Browser | None = None
+        self._headless = headless
+        self._default_proxy = proxy_url_to_playwright_proxy(default_proxy) if default_proxy else None
+
+    async def create_browser(self):
+        self._playwright = await async_playwright().start()
+        self._browser = await self._playwright.chromium.launch(
+            headless=self._headless, proxy=self._default_proxy)
+
+    async def __aenter__(self):
+        await self.create_browser()
+        return self
+
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
+        await self._browser.close()
+        await self._playwright.stop()
+
+    async def solve_captcha(self, page: Page, solved_captcha: str) -> bool:
+        element = await page.query_selector("#arkose_iframe, input[type='submit'].Button.EdgeButton.EdgeButton--primary")
+
+        if element and element.get_attribute("value") == "Continue to Twitter":
+            await element.click()
+            print(f'Account successfully unfrozen')
+
+        if element and element.get_attribute('value') == 'Delete':
+            await element.click()
+            print(f'click delete')
+
+        if element.get_attribute('value') == 'Start':
+            await element.click()
+
+            await page.goto('https://twitter.com/account/access')
+            await page.wait_for_selector('#arkose_iframe')
+
+        iframe_element = await page.query_selector('#arkose_iframe')
+        if not iframe_element:
+            if "twitter.com/home" in page.url:
+                return True
+
+        iframe = iframe_element.content_frame()
+        script = f'parent.postMessage(JSON.stringify({{eventId:"challenge-complete",payload:{{sessionToken:"{solved_captcha}"}}}}),"*")'
+        await iframe.evaluate(script)
+        await page.wait_for_load_state(state='networkidle', timeout=10000)
+
+    @staticmethod
+    def wait_for_url(page, url, timeout=60):
+        start_time = time.time()
+        while time.time() - start_time < timeout:
+            if url in page.url:
+                return True
+            time.sleep(1)
+        return False
+
+    async def wait_for_multiple_conditions(self, page, selector, url, timeout=60000) -> tuple[any, any]:
+        try:
+            start_time = time.time()
+            while time.time() - start_time < timeout / 1000:
+                element = await page.query_selector(selector)
+                if element:
+                    return None, element
+
+                if self.wait_for_url(page, url, 1):
+                    return True, None
+
+            return None, None
+
+        except (PlaywrightError, PlaywrightTimeoutError) as e:
+            return None, None
+
+    async def unlock(
+            self,
+            account: TwitterAccount,
+            *,
+            proxy: str = None,
+            default_timeout: int = 10,
+    ):
+        proxy = proxy_url_to_playwright_proxy(proxy) if proxy else None
+        context = await self._browser.new_context(proxy=proxy)
+        cookies = [
+            {
+                "name": "auth_token",
+                "value": account.auth_token,
+                "domain": "twitter.com",
+                "path": "/",
+            },
+        ]
+        await context.add_cookies(cookies)
+        page = await context.new_page()
+        page.set_default_timeout(default_timeout * 1000)
+        await stealth_async(page)
+
+        await page.goto(f"https://twitter.com/account/access")
+        await page.wait_for_load_state(state='networkidle')
+
+        if "access" not in page.url:
+            return
+
+        arkose_iframe = await page.query_selector("#arkose_iframe")
+        button = await page.wait_for_selector('//*[@id="root"]/div/div[1]/button')
+        await button.click()
+
+        ...
+
+        await context.close()

@@ -1,0 +1,435 @@
+import base64
+import re
+from random import choice
+from typing import Any
+from time import time
+import string
+
+from curl_cffi import requests
+from yarl import URL
+
+from .account import DiscordAccount, DiscordAccountStatus
+from .errors import (
+    HTTPException,
+    BadRequest,
+    Unauthorized,
+    CaptchaRequired,
+    RateLimited,
+    Forbidden,
+    NotFound,
+    DiscordServerError,
+)
+from .cloudflare import CLOUDFLARE_PATTERN, encrypt_wp, user_agent_to_wp, generate_cloudflare_code
+from ..base import BaseClient
+from ..utils import to_json
+
+
+def encode_x_properties(properties: dict) -> str:
+    return base64.b64encode(to_json(properties).encode('utf-8')).decode('utf-8')
+
+
+def create_x_context_properties(location_guild_id: str, location_channel_id: str) -> str:
+    x_context_properties = {
+        "location": "Accept Invite Page",
+        "location_guild_id": location_guild_id,
+        "location_channel_id": location_channel_id,
+        "location_channel_type": 0
+    }
+    return encode_x_properties(x_context_properties)
+
+
+def create_x_super_properties(
+        user_agent: str,
+        client_build_number: int,
+        *,
+        browser: str = "Chrome",
+        browser_version: str = "110.0.0.0",
+        os: str = 'Windows',
+        os_version: str = '10',
+        system_locale: str = "en-US",
+) -> str:
+    x_super_properties = {
+        'browser': browser,
+        'browser_user_agent': user_agent,
+        'browser_version': browser_version,
+        'client_build_number': client_build_number,
+        'client_event_source': None,
+        'device': '',
+        'os': os,
+        'os_version': os_version,
+        'referrer': 'https://discord.com/',
+        'referrer_current': '',
+        'referring_domain': 'discord.com',
+        'referring_domain_current': '',
+        'release_channel': 'stable',
+        'system_locale': system_locale}
+    return encode_x_properties(x_super_properties)
+
+
+def generate_nonce() -> str:
+    return str((int(time()) * 1000 - 1420070400000) * 4194304)
+
+
+def generate_session_id() -> str:
+    return "".join(choice(string.ascii_letters + string.digits) for _ in range(32))
+
+
+def json_or_text(response: requests.Response) -> dict[str, Any] or str:
+    try:
+        if response.headers['content-type'] == 'application/json':
+            return response.json()
+    except KeyError:
+        # Thanks Cloudflare
+        pass
+
+    return response.text
+
+
+class DiscordClient(BaseClient):
+    BASE_URL = f"https://discord.com"
+    API_VERSION = 9
+    BASE_API_URL = f"{BASE_URL}/api/v{API_VERSION}"
+    DEFAULT_HEADERS = {
+        "authority": "discord.com",
+        "accept": "*/*",
+        "origin": "https://discord.com",
+        "connection": "keep-alive",
+        "sec-ch-ua-mobile": "?0",
+        "sec-ch-ua-platform": '"Windows"',
+        "sec-ch-ua": '"Chromium";v="110", "Not A(Brand";v="24", "Google Chrome";v="110"',
+        "sec-fetch-dest": "empty",
+        "sec-fetch-mode": "cors",
+        "sec-fetch-site": "same-origin",
+        "x-debug-options": "bugReporterEnabled",
+    }
+    CLIENT_BUILD_NUMBER = 251818
+
+    def __init__(
+            self,
+            account: DiscordAccount,
+            *,
+            locale: str = "en-US",
+            **session_kwargs,
+    ):
+        super().__init__(**session_kwargs)
+        self.account = account
+        self.x_super_properties = create_x_super_properties(self.session.user_agent, self.CLIENT_BUILD_NUMBER)
+        self.session.cookies.set("locale", locale, "discord.com", "/")
+        self.session.headers.update({
+            "x-discord-locale": locale,
+            "accept-language": f"{locale},{locale.split('-')[0]};q=0.9",
+        })
+
+    async def request(
+            self,
+            method,
+            url,
+            **kwargs,
+    ) -> tuple[requests.Response, dict[str, Any] or str]:
+        headers = kwargs.pop("headers", {})
+        headers["authorization"] = self.account.auth_token
+        headers["x-super-properties"] = self.x_super_properties
+
+        response = await self.session.request(
+            method,
+            url,
+            headers=headers,
+            **kwargs,
+        )
+
+        data = json_or_text(response)
+
+        if response.status_code == 400:
+            if data.get("captcha_key"):
+                raise CaptchaRequired(response, data)
+            raise BadRequest(response, data)
+
+        if response.status_code == 401:
+            self.account.status = DiscordAccountStatus.BAD_TOKEN
+            raise Unauthorized(response, data)
+
+        if response.status_code == 403:
+            raise Forbidden(response, data)
+
+        if response.status_code == 404:
+            raise NotFound(response, data)
+
+        if response.status_code == 429:
+            if not response.headers.get("via") or isinstance(data, str):
+                # Banned by Cloudflare more than likely.
+                raise HTTPException(response, data)
+
+            retry_after = data["retry_after"]
+            raise RateLimited(retry_after)
+
+        if response.status_code >= 500:
+            raise DiscordServerError(response, data)
+
+        if not 200 <= response.status_code < 300:
+            raise HTTPException(response, data)
+
+        if "flags" in data and "public_flags" in data:
+            flags_data = data['flags'] - data['public_flags']
+
+            if flags_data == 17592186044416:
+                self.account.is_quarantined = True
+            elif flags_data == 1048576:
+                self.account.is_spammer = True
+            elif flags_data == 17592186044416 + 1048576:
+                self.account.is_spammer = True
+                self.account.is_quarantined = True
+
+        self.account.status = DiscordAccountStatus.GOOD
+        return response, data
+
+    async def _request_base_cloudflare_cookies(self):
+        """
+        Request cloudflare cookies to bypass protection (__dcfduid, __sdcfduid, __cfruid, _cfuvid)
+        """
+        url = f"{self.BASE_URL}/login"
+        headers = {
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7',
+            'Connection': 'keep-alive',
+            'Sec-Fetch-Dest': 'document',
+            'Sec-Fetch-Mode': 'navigate',
+            'Sec-Fetch-Site': 'none',
+            'Sec-Fetch-User': '?1',
+            'Upgrade-Insecure-Requests': '1',
+        }
+        await self.request("GET", url, headers=headers)
+
+    async def _experiments(self):
+        url = f"{self.BASE_API_URL}/experiments"
+        response, data = await self.request("GET", url)
+        return data
+
+    async def _guild_experiments(
+            self,
+            invite_code: str,
+            guild_id: int | str,
+            channel_id: int | str,
+    ) -> dict:
+        url = f"{self.BASE_API_URL}/experiments"
+        headers = {
+            'referer': f'https://discord.com/invite/{invite_code}',
+            'x-context-properties': create_x_context_properties(guild_id, channel_id),
+        }
+        response, data = await self.request("GET", url, headers=headers)
+        return data
+
+    async def _request_s_key(self) -> tuple[str, str]:
+        url = f"{self.BASE_URL}/cdn-cgi/challenge-platform/scripts/invisible.js"
+        response, data = await self.request("GET", url)
+
+        key = 'x3MU-7nK0tLQlyRoIXNDZOiPF+c26s$gdJAVzEv9qmapSuh5bwfjHYTk18eWBG4rC'
+        for x in response.text.split(';'):
+            if len(x) == 65 and '=' not in x:
+                key = x
+
+        x = re.findall(CLOUDFLARE_PATTERN, response.text)
+        s = '0.' + ':'.join(x[0])
+        return s, key
+
+    async def bypass_cloudflare_protection(self):
+        await self._request_base_cloudflare_cookies()
+        s, key = await self._request_s_key()
+        wp = user_agent_to_wp(self.session.user_agent)
+        wp = encrypt_wp(to_json(wp), key)
+        payload = {'wp': wp, 's': s}
+        url = f"{self.BASE_URL}/cdn-cgi/challenge-platform/h/b/jsd/r/{generate_cloudflare_code()}"
+        await self.request("POST", url, json=payload)
+
+    # async def request(
+    #         self,
+    #         method,
+    #         url,
+    #         params: dict = None,
+    #         headers: dict = None,
+    #         json: Any = None,
+    #         data: Any = None,
+    #         **kwargs,
+    # ) -> tuple[requests.Response, dict[str, Any] or str]:
+    #     await self.bypass_cloudflare_protection()
+    #     return await self._request(method, url, params, headers, json, data, **kwargs)
+
+    async def bind_app(
+            self,
+            *,
+            client_id: str,
+            scope: str,
+            state: str = None,
+            response_type: str = "code",
+    ):
+        url = f"{self.BASE_API_URL}/oauth2/authorize"
+        params = {
+            "client_id": client_id,
+            "response_type": response_type,
+            "scope": scope,
+        }
+        if state: params["state"] = state
+        payload = {
+            "permissions": "0",
+            "authorize": True,
+        }
+        response, data = await self.request("POST", url, json=payload, params=params)
+        bind_url = URL(data["location"])
+        bind_code = bind_url.query.get("code")
+        return bind_code
+
+    async def send_guild_chat_message(
+            self,
+            guild_id: int | str,
+            channel_id: int | str,
+            message: str,
+    ) -> int:
+        """
+        :param guild_id: ID Сервера.
+        :param channel_id: ID Канала.
+        :param message: Сообщение.
+        :return: ID сообщения.
+        """
+        url = f"{self.BASE_API_URL}/channels/{channel_id}/messages"
+        headers = {
+            "referer": f"{self.BASE_URL}/channels/{guild_id}/{channel_id}",
+        }
+        payload = {
+            "mobile_network_type": "unknown",
+            "content": message,
+            "nonce": generate_nonce(),
+            "tts": False,
+            "flags": 0,
+        }
+        response, data = await self.request("POST", url, json=payload, headers=headers)
+        message_id = data["id"]
+        return message_id
+
+    async def send_reaction(
+            self,
+            channel_id: int | str,
+            message_id: int | str,
+            emoji: str,
+    ):
+        """
+        :param channel_id: ID Канала.
+        :param message_id: ID Сообщения.
+        :param emoji: Реакция. Например: ✅, ❤️, 👍, 🇷🇺
+        """
+        url = f"{self.BASE_API_URL}/channels/{channel_id}/messages/{message_id}/reactions/{emoji}/@me"
+        await self.request("PUT", url)
+
+    async def press_button(
+            self,
+            guild_id: int | str,
+            channel_id: int | str,
+            message_id: int | str,
+            application_id: int | str,
+            button_data: dict,
+    ):
+        url = f"{self.BASE_API_URL}/interactions"
+        headers = {
+            'authority': 'discord.com',
+            'accept': '*/*',
+            'content-type': 'application/json',
+            'origin': 'https://discord.com',
+            'referer': f'https://discord.com/channels/{guild_id}/{channel_id}',
+            'sec-ch-ua-mobile': '?0',
+            'sec-ch-ua-platform': '"Windows"',
+            'sec-fetch-dest': 'empty',
+            'sec-fetch-mode': 'cors',
+            'sec-fetch-site': 'same-origin',
+            'x-debug-options': 'bugReporterEnabled',
+            'x-discord-locale': 'en-US',
+        }
+        payload = {
+            'type': 3,
+            'nonce': generate_nonce(),
+            'guild_id': guild_id,
+            'channel_id': channel_id,
+            'message_flags': 0,
+            'message_id': message_id,
+            'application_id': application_id,
+            'session_id': generate_session_id(),
+            'data': {
+                'component_type': button_data['type'],
+                'custom_id': button_data['custom_id'],
+            }
+        }
+        response, data = await self.request("POST", url, headers=headers, json=payload)
+        return data
+
+    # get messages
+    async def request_messages(
+            self,
+            channel_id: int | str,
+            limit: int = 50,
+            before_date: str = None,
+            around_message_id: int | str = None,
+            after_message_id: int | str = None,
+    ) -> list[dict]:
+        """
+        :param limit: between 1 and 100
+        :param before_date: snowflake
+        :return: Message data
+        """
+        url = f"{self.BASE_API_URL}/channels/{channel_id}/messages"
+        params = {
+            "limit": limit,
+        }
+        if before_date: params["before"] = before_date
+        if around_message_id: params["around"] = around_message_id
+        if after_message_id: params["after"] = after_message_id
+        response, data = await self.request("GET", url, params=params)
+        return data
+
+    async def request_message(self, channel_id: int | str, message_id: int | str) -> dict:
+        messages = await self.request_messages(channel_id, limit=1, around_message_id=message_id)
+        return messages[0]
+
+    async def _request_join_data(
+            self,
+            invite_code: str,
+            captcha_response: str = None,
+            captcha_rqtoken: str = None,
+    ) -> dict:
+        url = f"{self.BASE_API_URL}/invites/{invite_code}"
+        params = {
+            "with_counts": "true",
+            "with_expiration": "true",
+        }
+        payload = {}
+        headers = {'referer': f'https://discord.com/invite/{invite_code}'}
+        if captcha_response and captcha_rqtoken:
+            headers["x-captcha-key"] = captcha_response
+            headers["x-captcha-rqtoken"] = captcha_rqtoken
+
+        response, data = await self.request("GET", url, headers=headers, json=payload, params=params)
+        return data
+
+    async def _confirm_join(
+            self,
+            invite_code: str,
+            guild_id: int | str,
+            channel_id: int | str,
+    ) -> dict:
+        url = f"{self.BASE_API_URL}/invites/{invite_code}"
+        payload = {
+            "session_id": None,
+        }
+        headers = {
+            'referer': f'https://discord.com/invite/{invite_code}',
+            'x-context-properties': create_x_context_properties(guild_id, channel_id),
+        }
+
+        response, data = await self.request("POST", url, headers=headers, json=payload)
+        return data
+
+    async def join_guild(
+            self,
+            invite_code: str,
+            captcha_response: str = None,
+            captcha_rqtoken: str = None,
+    ) -> dict:
+        join_data = await self._request_join_data(invite_code, captcha_response, captcha_rqtoken)
+        guild_id = join_data['guild_id']
+        channel_id = join_data['channel']['id']
+        return await self._confirm_join(invite_code, guild_id, channel_id)

@@ -1,0 +1,180 @@
+import base64
+import json
+import re
+import string
+from random import choice
+from time import time
+
+from ..utils import to_json
+
+
+class NewClient():
+
+    def start_websockets(self):
+        self.discum_client = discum.Client(
+            token=self.account.auth_token,
+            log={"console": False, "file": False},
+        )
+        self.discum_client.gateway.run(False)
+
+    def end_websockets(self):
+        self.discum_client.gateway.close()
+
+    # async def _get_guild_ids(self, invite_code: str) -> tuple[str, str]:
+    #     url = f"{self.BASE_API_URL}/invites/{invite_code}"
+    #     response, data = await self.request("GET", url)
+    #     # Может вылезти "You need to verify your account"
+    #
+    #     location_guild_id = data['guild_id']
+    #     location_channel_id = data['channel']['id']
+    #     return location_guild_id, location_channel_id
+
+    async def agree_with_rules(
+            self,
+            invite_code: str,
+            location_guild_id: int,
+            location_channel_id: int,
+    ):
+        url = f"{self.BASE_API_URL}/guilds/{location_guild_id}/member-verification"
+        params = {
+            "with_guild": False,
+            "invite_code": invite_code,
+        }
+
+        response, data = await self.request("GET", url, params=params)
+        if "Unknown Guild" in response.text:
+            print(f"This guild does not require agreement with the rules.")
+            return
+
+        url = f"{self.BASE_API_URL}/guilds/{location_guild_id}/requests/@me"
+        headers = {
+            "referrer": f'https://discord.com/channels/{location_guild_id}/{location_channel_id}'
+        }
+        form_fields = data['form_fields'][0]
+        payload = {
+            'version': data['version'],
+            'form_fields': [
+                {
+                    'field_type': form_fields['field_type'],
+                    'label': form_fields['label'],
+                    'description': form_fields['description'],
+                    'automations': form_fields['automations'],
+                    'required': True,
+                    'values': form_fields['values'],
+                    'response': True,
+                },
+            ],
+        }
+        await self.request("PUT", url, headers=headers, json=payload)
+
+    async def join_guild(
+            self,
+            invite_code: str,
+            captcha_response: str = None,
+            captcha_rqtoken: str = None,
+    ):
+        url = f"{self.BASE_API_URL}/invites/{invite_code}"
+        headers = None
+        if captcha_response and captcha_rqtoken:
+            headers = {
+                "x-captcha-key": captcha_response,
+                "x-captcha-rqtoken": captcha_rqtoken,
+            }
+        response, data = await self.request("GET", url, headers=headers)
+        # TODO Может вылезти "You need to verify your account"
+
+        location_guild_id = data['guild_id']
+        location_channel_id = data['channel']['id']
+        x_content_properties = create_x_context_properties(location_guild_id, location_channel_id)
+        headers = {"x_content_properties": x_content_properties}
+        payload = {"session_id": None}
+        await self.request("POST", url, headers=headers, json=payload)
+        await self.agree_with_rules(invite_code, location_guild_id, location_channel_id)
+
+
+    async def _change_user_data(
+            self,
+            payload: dict,
+            captcha_response: str = None,
+            captcha_rqtoken: str = None,
+    ) -> dict:
+        url = f"{self.BASE_API_URL}/users/@me"
+        headers = None
+        if captcha_response and captcha_rqtoken:
+            headers = {
+                "x-captcha-key": captcha_response,
+                "x-captcha-rqtoken": captcha_rqtoken,
+            }
+        response, data = await self.request("PATCH", url, headers=headers, json=payload)
+        return data
+
+    async def change_username(
+            self,
+            username: str,
+            captcha_response: str = None,
+            captcha_rqtoken: str = None,
+    ) -> dict:
+        if not self.account.password:
+            raise ValueError(f"Specify the current password before changing username.")
+
+        payload = {
+            "username": username,
+            "password": self.account.password,
+        }
+        data = await self._change_user_data(payload, captcha_response, captcha_rqtoken)
+        self.account.username = username
+        return data
+
+    async def change_name(
+            self,
+            name: str,
+            captcha_response: str = None,
+            captcha_rqtoken: str = None,
+    ) -> dict:
+        payload = {"global_name": name}
+        data = await self._change_user_data(payload, captcha_response, captcha_rqtoken)
+        self.account.name = name
+        return data
+
+    async def change_password(
+            self,
+            new_password: str,
+    ):
+        if not self.account.password:
+            raise ValueError(f"Specify the current password before changing it.")
+
+        url = f"{self.BASE_API_URL}/users/@me"
+        headers = {
+            'connection': 'keep-alive',
+            'referer': url,
+        }
+        payload = {
+            'password': self.account.password,
+            'new_password': new_password,
+        }
+        response, data = await self.request("PATCH", url, headers=headers, json=payload)
+        self.account.auth_token = data["token"]
+        self.account.password = new_password
+
+
+    # НЕ РАБОТАЕТ
+    async def request_build_number(self):
+        """
+        discum: getting the build num is kinda experimental since
+         who knows if discord will change where the build number is located...
+        """
+
+        url = "https://discord.com/login"
+        headers = {"Sec-Fetch-Dest": "document", "Sec-Fetch-Mode": "navigate", "Sec-Fetch-Site": "none"}
+        response, data = await self.request("GET", url, headers=headers)
+        cookies = response.cookies  # Можно установить тут или делать
+        # это еще в реквесте, устанавливая все "set-cookie"
+
+        # discum: fastest solution I could find since the last js file is huge in comparison to 2nd from last
+        assets = re.findall(r'assets/[a-z0-9.]+\.js', response.text)
+        url = f"{self.BASE_URL}/{assets[-2]}"
+        response, data = await self.request("GET", url)
+
+        # index_of_build_num = req_file_build.find('buildNumber') + 24
+        # build_number = int(req_file_build[index_of_build_num:index_of_build_num + 6])
+        return data
