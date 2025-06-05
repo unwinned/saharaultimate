@@ -8,8 +8,7 @@
 В целом все!
 
 Для запуска:
-pip install -r requirements.txt
-python main.py
+pip install -r requirements.txt, а потом python main.py
 
 По вопросам технической поддержки не стесняйся обращаться в канале: https://t.me/unwinned
 Удачи ;)
