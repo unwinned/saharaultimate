@@ -5,6 +5,9 @@
 Также заполни config.yaml своими api-ключами от OpenAi (для использования ChatGPT в Sahara Siwa) и Capmonster (для решения каптч в Sahara Legends).
 И на конец: создай папку prompts в run_siwa/data
 
+Также прокси должны быть в формате: {login}:{password}@{ip}:{port} (без дужек)
+А приватники просто в столбец вставьте и все!
+
 В целом все!
 
 Для запуска:
